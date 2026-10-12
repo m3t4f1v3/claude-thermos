@@ -2,22 +2,56 @@ import asyncio
 import json
 import socket
 import time
-from collections.abc import Callable, MutableMapping
+from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from dataclasses import dataclass
 from typing import Protocol
 
 import httpx
+from mitmproxy import http
 from mitmproxy.options import Options
 from mitmproxy.tools.dump import DumpMaster
 
 from claude_thermos.config import ANTHROPIC_BASE_URL, Config
+from claude_thermos.credentials import StoredLogin
 from claude_thermos.eventlog import EventLog, EventType, EventWriter
+from claude_thermos.limits import parse_rate_limits, rejection_headers
 from claude_thermos.lineage import LineageId, extract_session_id
 from claude_thermos.state import SessionState
-from claude_thermos.usage import Usage, parse_usage_json, parse_usage_sse
-from claude_thermos.warmer import Warmer
+from claude_thermos.usage import Usage, parse_stop_reason_sse, parse_usage_json, parse_usage_sse
+from claude_thermos.warmer import LIFT_PROMPT, Compactor, Warmer, update_pause
 
 MESSAGES_PATH = "/v1/messages"
+
+# The body of the refusal sent while a conversation is paused, in the API's
+# error shape. Claude Code shows its own usage-limit notice rather than this
+# message, but it says what happened to anyone reading the raw response.
+_PAUSED_ERROR = {
+    "type": "error",
+    "error": {
+        "type": "rate_limit_error",
+        "message": (
+            "claude-thermos paused this session near your session limit to keep its prompt "
+            "cache warm until the limit resets."
+        ),
+    },
+}
+
+# Local-only endpoint Claude Code's hooks post to (see `hook_settings`). The
+# proxy answers it itself; it is never forwarded upstream.
+HOOK_PATH = "/claude-thermos/hook"
+
+# The hook events the proxy listens for: a prompt submitted in a session marks
+# it as open in a terminal, SessionEnd closes it, and PostCompact reports that
+# its conversation was summarized.
+_HOOK_PROMPT = "UserPromptSubmit"
+_HOOK_SESSION_END = "SessionEnd"
+_HOOK_COMPACTED = "PostCompact"
+
+_SSE_CONTENT_TYPE = "text/event-stream"
+
+# mitmproxy's own type for `Response.stream`: False buffers the body, a callable
+# is handed each chunk as it arrives and returns what to forward.
+StreamSetting = Callable[[bytes], Iterable[bytes] | bytes] | bool
 
 # How often the detached-proxy session reaper scans for idle sessions to evict.
 _REAP_INTERVAL_SEC = 60.0
@@ -90,17 +124,27 @@ class _RequestLike(Protocol):
 
 
 class _ResponseLike(Protocol):
+    """The subset of mitmproxy's Response that WarmerAddon's hooks read, plus
+    `stream`, which the responseheaders hook sets to pass a body through."""
+
+    stream: StreamSetting
+
     @property
     def content(self) -> bytes | None: ...
+    @property
+    def headers(self) -> Mapping[str, str]: ...
 
 
 class FlowLike(Protocol):
-    """The subset of mitmproxy's HTTPFlow that WarmerAddon's hooks use."""
+    """The subset of mitmproxy's HTTPFlow that WarmerAddon's hooks use.
+    `response` is settable because the proxy answers its own hook endpoint."""
 
     @property
     def request(self) -> _RequestLike: ...
     @property
     def response(self) -> _ResponseLike | None: ...
+    @response.setter
+    def response(self, value: http.Response) -> None: ...
 
 
 def _handle_request(
@@ -114,7 +158,9 @@ def _handle_request(
     """Record a request on state and emit session/lineage events.
 
     Emits session_start on the first request ever seen for the session and
-    lineage_seen on the first sight of a lineage.
+    lineage_seen on the first sight of a lineage. A side request (see
+    `SessionState.is_side_request`) is logged and otherwise ignored, apart
+    from its credentials, which are as current as any other request's.
 
     Args:
         state: The session's state.
@@ -128,6 +174,11 @@ def _handle_request(
         The resolved lineage id.
     """
     lineage = LineageId.from_request_body(body)
+    if state.is_side_request(lineage, body, now):
+        state.note_credentials(headers)
+        eventlog.emit(EventType.SIDE_REQUEST, lineage_id=lineage)
+        return lineage
+
     is_new_session = not seen_lineages
     is_new_lineage = lineage not in seen_lineages
 
@@ -144,11 +195,32 @@ def _handle_request(
     return lineage
 
 
-def _parse_usage(raw_response: bytes) -> Usage:
+def _is_sse(raw_response: bytes) -> bool:
     stripped = raw_response.lstrip()
-    if stripped.startswith(b"event:") or stripped.startswith(b"data:"):
-        return parse_usage_sse([raw_response])
-    return parse_usage_json(json.loads(raw_response))
+    return stripped.startswith(b"event:") or stripped.startswith(b"data:")
+
+
+def _parse_response(raw_response: bytes) -> tuple[Usage, str | None]:
+    """Parse usage and the stop reason from a /v1/messages response.
+
+    A body that is neither SSE nor a JSON object (an interrupted stream, an
+    upstream error page) yields zero usage and no stop reason, so the
+    response is still recorded on its lineage.
+
+    Args:
+        raw_response: The raw response bytes.
+
+    Returns:
+        The response's usage and its stop_reason, or None if it has none.
+    """
+    try:
+        if _is_sse(raw_response):
+            return parse_usage_sse([raw_response]), parse_stop_reason_sse([raw_response])
+        body = json.loads(raw_response)
+        stop_reason = body.get("stop_reason")
+        return parse_usage_json(body), stop_reason if isinstance(stop_reason, str) else None
+    except (ValueError, AttributeError):
+        return Usage(0, 0, 0, 0), None
 
 
 def _handle_response(
@@ -157,11 +229,15 @@ def _handle_response(
     lineage: LineageId,
     raw_response: bytes,
     now: float,
+    headers: Mapping[str, str] | None = None,
+    side: bool = False,
 ) -> None:
     """Record a response on state and emit a usage event.
 
-    Parses usage from `raw_response`, records the response on `state`, and
-    emits a usage event.
+    Parses usage and the stop reason from `raw_response`, records the
+    response on `state`, and emits a usage event. Subscription limits in
+    `headers` replace the session's last reading. A side request's response
+    updates the limits and the log but not its lineage.
 
     Args:
         state: The session's state.
@@ -169,9 +245,16 @@ def _handle_response(
         lineage: The response's lineage id.
         raw_response: The raw response bytes.
         now: Current time, in seconds.
+        headers: The response headers, if available.
+        side: Whether the response answers a side request.
     """
-    usage = _parse_usage(raw_response)
-    state.on_response(lineage, now)
+    limits = parse_rate_limits(headers) if headers is not None else None
+    if limits is not None:
+        state.limits = limits
+    usage, stop_reason = _parse_response(raw_response)
+    if not side:
+        input_tokens = usage.uncached_input + usage.cache_read + usage.cache_creation
+        state.on_response(lineage, now, stop_reason, input_tokens)
     eventlog.emit(
         EventType.USAGE,
         lineage_id=lineage,
@@ -184,6 +267,26 @@ def _handle_response(
     )
 
 
+def hook_settings(port: int) -> dict:
+    """Return Claude Code settings that report session events to the proxy.
+
+    Registers HTTP hooks pointing at the proxy's own HOOK_PATH, so the
+    warmer knows which session a terminal has open, when that session ends,
+    and when its conversation was compacted. Keepalive only ever applies to
+    a session reported this way.
+
+    Args:
+        port: Loopback port the proxy listens on.
+
+    Returns:
+        A settings object suitable for `claude --settings`.
+    """
+    handler = {"hooks": [{"type": "http", "url": f"http://127.0.0.1:{port}{HOOK_PATH}"}]}
+    return {
+        "hooks": {event: [handler] for event in (_HOOK_PROMPT, _HOOK_SESSION_END, _HOOK_COMPACTED)}
+    }
+
+
 @dataclass
 class _Session:
     state: SessionState
@@ -194,7 +297,10 @@ class _Session:
 class WarmerAddon:
     """mitmproxy addon that observes /v1/messages traffic into per-session
     SessionState + EventLog, emits structured events, and drives a Warmer
-    that refreshes the main lineage's cache prefix while a subagent runs.
+    that refreshes the main lineage's cache prefix while it sits idle.
+    Streamed responses are passed through as they arrive rather than
+    buffered, so Claude Code still sees tokens (and its stream watchdogs
+    still see bytes) while the addon keeps its own copy to parse.
 
     Unless warming is disabled, the addon owns a Warmer and a background
     task started from mitmproxy's `running` hook (on the proxy event loop)
@@ -213,6 +319,9 @@ class WarmerAddon:
         client: httpx.AsyncClient | None = None,
         upstream: str | None = None,
         reap_sessions: bool = False,
+        compactor: Compactor | None = None,
+        single_session: bool = False,
+        login: StoredLogin | None = None,
     ) -> None:
         self._config = config if config is not None else Config()
         if eventlog_factory is None:
@@ -225,7 +334,24 @@ class WarmerAddon:
         self._warmer: Warmer | None = None
         if not self._config.disabled:
             base_url = upstream if upstream is not None else ANTHROPIC_BASE_URL
-            self._warmer = Warmer(self._config, base_url=base_url, client=client)
+            self._warmer = Warmer(
+                self._config,
+                base_url=base_url,
+                client=client,
+                compactor=compactor,
+                login=login,
+            )
+        # Keyed by id(flow), for the life of one exchange: the chunks of a
+        # response being streamed through, and the flows that are side requests.
+        self._streamed: dict[int, list[bytes]] = {}
+        self._side_flows: set[int] = set()
+        # Requests answered with the pause refusal, which never reached the API.
+        self._refused: set[int] = set()
+        # Sessions a hook reported open. The launcher fronts one terminal, so
+        # there a newly reported session replaces the last; the daemon serves
+        # many clients and waits for each session's own SessionEnd.
+        self._live: set[str] = set()
+        self._single_session = single_session
         # Session eviction is only for the long-lived daemon; the launcher
         # process dies with claude, so its default behavior stays unchanged.
         self._reap_sessions = reap_sessions
@@ -257,11 +383,15 @@ class WarmerAddon:
 
         On a /v1/messages request, decodes the JSON body, resolves
         session/lineage, updates state, and forces accept-encoding:
-        identity so the response usage parses.
+        identity so the response usage parses. A hook post is answered
+        locally, and so is a model request from a paused session.
 
         Args:
             flow: The mitmproxy flow for the request.
         """
+        if flow.request.path.startswith(HOOK_PATH):
+            self._handle_hook(flow)
+            return
         if not flow.request.path.startswith(MESSAGES_PATH):
             return
         flow.request.headers["accept-encoding"] = "identity"
@@ -270,24 +400,60 @@ class WarmerAddon:
         if resolved is None:
             return
         session, body = resolved
+        now = time.time()
+        if self._refuse_if_paused(flow, session, now):
+            return
+        if session.state.is_side_request(LineageId.from_request_body(body), body, now):
+            self._side_flows.add(id(flow))
         _handle_request(
             session.state,
             session.eventlog,
             body,
             dict(flow.request.headers),
-            time.time(),
+            now,
             session.seen_lineages,
         )
+
+    def responseheaders(self, flow: FlowLike) -> None:
+        """Handle a mitmproxy responseheaders hook.
+
+        Switches a streamed /v1/messages response to pass-through, teeing
+        each chunk into a buffer the response hook parses. Without this
+        mitmproxy holds the whole response until it completes.
+
+        Args:
+            flow: The mitmproxy flow whose response headers arrived.
+        """
+        response = flow.response
+        if response is None or not flow.request.path.startswith(MESSAGES_PATH):
+            return
+        if not response.headers.get("content-type", "").startswith(_SSE_CONTENT_TYPE):
+            return
+        chunks: list[bytes] = []
+        self._streamed[id(flow)] = chunks
+
+        def tee(chunk: bytes) -> bytes:
+            chunks.append(chunk)
+            return chunk
+
+        response.stream = tee
 
     def response(self, flow: FlowLike) -> None:
         """Handle a mitmproxy response hook.
 
-        Parses usage from the response, updates state, and emits a usage
-        event. Never modifies the response body.
+        Parses usage, the stop reason, and subscription limits from the
+        response, updates state, and emits a usage event. Never modifies
+        the response body.
 
         Args:
             flow: The mitmproxy flow for the response.
         """
+        chunks = self._streamed.pop(id(flow), None)
+        side = id(flow) in self._side_flows
+        self._side_flows.discard(id(flow))
+        if id(flow) in self._refused:
+            self._refused.discard(id(flow))
+            return
         if flow.response is None:
             return
         resolved = self._resolve_session_and_body(flow)
@@ -299,9 +465,110 @@ class WarmerAddon:
             session.state,
             session.eventlog,
             lineage,
-            flow.response.content or b"",
+            b"".join(chunks) if chunks is not None else flow.response.content or b"",
             time.time(),
+            headers=flow.response.headers,
+            side=side,
         )
+
+    def error(self, flow: FlowLike) -> None:
+        """Handle a mitmproxy error hook.
+
+        A request that ends without a complete response (the user
+        interrupted it, or the connection dropped) never reaches the
+        response hook, so its lineage is released here. Otherwise it would
+        count as in flight, and never idle, for the rest of the session.
+
+        Args:
+            flow: The mitmproxy flow that failed.
+        """
+        self._streamed.pop(id(flow), None)
+        side = id(flow) in self._side_flows
+        self._side_flows.discard(id(flow))
+        if id(flow) in self._refused:
+            self._refused.discard(id(flow))
+            return
+        resolved = self._resolve_session_and_body(flow)
+        if resolved is None or side:
+            return
+        session, body = resolved
+        session.state.on_response(LineageId.from_request_body(body), time.time())
+
+    def _refuse_if_paused(self, flow: FlowLike, session: _Session, now: float) -> bool:
+        """Answer a model request with a usage-limit refusal if its session
+        is paused, and report whether it did.
+
+        The refusal has the shape of the API's own at the session limit, so
+        Claude Code stops at this request boundary, waits for the reset in
+        the open session, and then sends the request again. Token counting
+        is free, so it is never refused.
+
+        Args:
+            flow: The mitmproxy flow for the request.
+            session: The request's session.
+            now: Current time, in seconds.
+
+        Returns:
+            True iff the request was answered here and must not go upstream.
+        """
+        if flow.request.path.split("?", 1)[0] != MESSAGES_PATH:
+            return False
+        state = session.state
+        if not update_pause(state, session.eventlog, self._config, now):
+            return False
+        if state.limits is None or state.paused_until is None:
+            return False
+        headers = rejection_headers(state.limits, state.paused_until, now)
+        headers["content-type"] = "application/json"
+        flow.response = http.Response.make(429, json.dumps(_PAUSED_ERROR), headers)
+        self._refused.add(id(flow))
+        return True
+
+    def _handle_hook(self, flow: FlowLike) -> None:
+        """Answer a Claude Code hook post and record what it reports.
+
+        The hook posts its JSON input, which names the event and the
+        session. The request is answered here and never forwarded upstream.
+
+        Args:
+            flow: The mitmproxy flow carrying the hook's POST.
+        """
+        try:
+            payload = json.loads(flow.request.get_text() or "")
+        except (json.JSONDecodeError, ValueError):
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("session_id"), str):
+            self._on_hook(payload["session_id"], payload)
+        # An empty 2xx body is a successful hook with no output.
+        flow.response = http.Response.make(200)
+
+    def _on_hook(self, session_id: str, payload: dict) -> None:
+        event = payload.get("hook_event_name")
+        if event == _HOOK_PROMPT:
+            if self._single_session:
+                self._live.clear()
+            self._live.add(session_id)
+        elif event == _HOOK_SESSION_END:
+            self._live.discard(session_id)
+        for known_id, known in self._sessions.items():
+            known.state.live = known_id in self._live
+        session = self._sessions.get(session_id)
+        if event == _HOOK_PROMPT and session is not None and self._config.keepalive:
+            # A prompt sent past the pause threshold is the user choosing to
+            # spend what is left of the session limit.
+            if session.state.waive_pause(time.time(), self._config.pause_at):
+                session.eventlog.emit(
+                    EventType.PAUSE_LIFTED,
+                    lineage_id=session.state.main_lineage_id() or LineageId(""),
+                    reason=LIFT_PROMPT,
+                )
+        if event == _HOOK_COMPACTED and session is not None:
+            session.state.on_compacted(time.time())
+            session.eventlog.emit(
+                EventType.COMPACTED,
+                lineage_id=session.state.main_lineage_id() or LineageId(""),
+                trigger=payload.get("trigger"),
+            )
 
     def done(self) -> None:
         """Handle mitmproxy's addon shutdown hook.
@@ -374,8 +641,10 @@ class WarmerAddon:
     def _get_or_create_session(self, session_id: str) -> _Session:
         session = self._sessions.get(session_id)
         if session is None:
+            state = SessionState(session_id)
+            state.live = session_id in self._live
             session = _Session(
-                state=SessionState(session_id),
+                state=state,
                 eventlog=self._eventlog_factory(session_id),
                 seen_lineages=set(),
             )

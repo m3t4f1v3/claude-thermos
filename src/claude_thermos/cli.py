@@ -51,6 +51,51 @@ def _warmer_options(func: Callable) -> Callable:
         envvar="CLAUDE_THERMOS_SUBAGENT_ACTIVE_WINDOW_SEC",
         help="Subagent active window, in seconds.",
     )(func)
+    func = click.option(
+        "--keepalive/--no-keepalive",
+        default=True,
+        show_default=True,
+        envvar="CLAUDE_THERMOS_KEEPALIVE",
+        help="Keep warming after the turn ends, while the session waits on you.",
+    )(func)
+    func = click.option(
+        "--keepalive-interval",
+        "keepalive_interval_raw",
+        default="auto",
+        show_default=True,
+        envvar="CLAUDE_THERMOS_KEEPALIVE_INTERVAL_SEC",
+        help='Seconds between warms of a one-hour cache, or "auto" for 55 minutes.',
+    )(func)
+    func = click.option(
+        "--ping-budget",
+        "ping_budget_pct",
+        type=float,
+        default=10.0,
+        show_default=True,
+        envvar="CLAUDE_THERMOS_PING_BUDGET",
+        help="Percent of the subscription session limit one idle spell may spend on warms.",
+    )(func)
+    func = click.option(
+        "--session-reserve",
+        "session_reserve_pct",
+        type=float,
+        default=5.0,
+        show_default=True,
+        envvar="CLAUDE_THERMOS_SESSION_RESERVE",
+        help="Percent of each subscription limit that warms must leave unused.",
+    )(func)
+    func = click.option(
+        "--pause-at",
+        "pause_at_pct",
+        type=float,
+        default=95.0,
+        show_default=True,
+        envvar="CLAUDE_THERMOS_PAUSE_AT",
+        help=(
+            "Percent of the session limit at which to pause the conversation until the limit "
+            "resets, keeping the rest for warms; 100 never pauses."
+        ),
+    )(func)
     return func
 
 
@@ -59,6 +104,13 @@ def _build(
     warm_interval_sec: int,
     max_cycles_raw: str,
     subagent_active_window_sec: int,
+    keepalive: bool,
+    keepalive_interval_raw: str,
+    ping_budget_pct: float,
+    session_reserve_pct: float,
+    pause_at_pct: float,
+    compact: bool = False,
+    compact_min_tokens: int = 100_000,
 ) -> Config:
     try:
         return build_config(
@@ -67,9 +119,16 @@ def _build(
             max_cycles_raw,
             subagent_active_window_sec,
             os.environ,
+            keepalive=keepalive,
+            keepalive_interval_raw=keepalive_interval_raw,
+            ping_budget_pct=ping_budget_pct,
+            session_reserve_pct=session_reserve_pct,
+            compact=compact,
+            compact_min_tokens=compact_min_tokens,
+            pause_at_pct=pause_at_pct,
         )
     except ValueError as exc:
-        raise click.BadParameter(str(exc), param_hint="-n / --max-cycles") from exc
+        raise click.BadParameter(str(exc)) from exc
 
 
 class _ThermosCLI(click.Group):
@@ -115,18 +174,50 @@ def main() -> None:
     envvar="CLAUDE_THERMOS_BIN",
     help="Name or path of the `claude` executable to launch; a bare name is looked up on PATH.",
 )
+@click.option(
+    "--compact/--no-compact",
+    default=True,
+    show_default=True,
+    envvar="CLAUDE_THERMOS_COMPACT",
+    help="Run /compact when an ended turn can no longer be kept warm.",
+)
+@click.option(
+    "--compact-min-tokens",
+    type=click.IntRange(min=0),
+    default=100_000,
+    show_default=True,
+    envvar="CLAUDE_THERMOS_COMPACT_MIN_TOKENS",
+    help="Smallest conversation, in tokens, worth compacting.",
+)
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def launch(
     idle_threshold_sec: int,
     warm_interval_sec: int,
     max_cycles_raw: str,
     subagent_active_window_sec: int,
+    keepalive: bool,
+    keepalive_interval_raw: str,
+    ping_budget_pct: float,
+    session_reserve_pct: float,
+    pause_at_pct: float,
     claude_bin: str,
+    compact: bool,
+    compact_min_tokens: int,
     claude_args: tuple[str, ...],
 ) -> None:
     """Launch Claude Code behind the warming proxy (the default action)."""
     config = _build(
-        idle_threshold_sec, warm_interval_sec, max_cycles_raw, subagent_active_window_sec
+        idle_threshold_sec,
+        warm_interval_sec,
+        max_cycles_raw,
+        subagent_active_window_sec,
+        keepalive,
+        keepalive_interval_raw,
+        ping_budget_pct,
+        session_reserve_pct,
+        pause_at_pct,
+        compact,
+        compact_min_tokens,
     )
     sys.exit(run_launcher(config, list(claude_args), claude_bin=claude_bin))
 
@@ -162,6 +253,11 @@ def serve(
     warm_interval_sec: int,
     max_cycles_raw: str,
     subagent_active_window_sec: int,
+    keepalive: bool,
+    keepalive_interval_raw: str,
+    ping_budget_pct: float,
+    session_reserve_pct: float,
+    pause_at_pct: float,
     port: int,
     upstream: str,
     session_ttl_sec: int,
@@ -178,7 +274,17 @@ def serve(
             param_hint="--upstream",
         )
     config = replace(
-        _build(idle_threshold_sec, warm_interval_sec, max_cycles_raw, subagent_active_window_sec),
+        _build(
+            idle_threshold_sec,
+            warm_interval_sec,
+            max_cycles_raw,
+            subagent_active_window_sec,
+            keepalive,
+            keepalive_interval_raw,
+            ping_budget_pct,
+            session_reserve_pct,
+            pause_at_pct,
+        ),
         session_ttl_sec=session_ttl_sec,
     )
     sys.exit(run_server(config, port, upstream))

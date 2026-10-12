@@ -69,7 +69,7 @@ async def test_warmer_task_starts_and_fires(tmp_path: Path) -> None:
 
     assert addon._warmer is not None
     for state, eventlog in addon.active_sessions():
-        await addon._warmer.tick(state, eventlog, now=400)
+        await addon._warmer.tick(state, eventlog, now=280)
 
     addon.done()
 
@@ -89,7 +89,7 @@ async def test_summary_written_on_shutdown(tmp_path: Path) -> None:
     _seed_idle_with_subagent(addon)
     assert addon._warmer is not None
     for state, eventlog in addon.active_sessions():
-        await addon._warmer.tick(state, eventlog, now=400)
+        await addon._warmer.tick(state, eventlog, now=280)
 
     addon.done()
 

@@ -138,3 +138,49 @@ def test_shared_writer_serves_multiple_sessions(tmp_path: Path) -> None:
     events_b = (tmp_path / "sess-b" / "events.jsonl").read_text().splitlines()
     assert [json.loads(line)["event"] for line in events_a] == ["session_start", "warm_fired"]
     assert [json.loads(line)["event"] for line in events_b] == ["session_start"]
+
+
+def _summary_after(tmp_path: Path, *events: tuple[EventType, dict]) -> dict:
+    log = EventLog("sess-ttl", root=tmp_path)
+    for event, fields in events:
+        log.emit(event, LineageId("lineage-a"), **fields)
+    log.close()
+    return json.loads((tmp_path / "sess-ttl" / "summary.json").read_text())
+
+
+def test_summary_prices_an_avoided_one_hour_rewrite_at_twice_input(tmp_path: Path) -> None:
+    summary = _summary_after(
+        tmp_path,
+        (EventType.WARM_FIRED, {}),
+        (EventType.WARM_RESULT, {"usage": {"cache_read": 100_000}, "ttl_sec": 3600}),
+        (EventType.RESUME_DETECTED, {}),
+    )
+
+    assert summary["rewrite_avoided_tokens"] == 100_000
+    assert summary["rewrite_avoided_cost"] == 200_000.0
+    assert summary["net_savings"] == 190_000.0
+
+
+def test_summary_prices_an_avoided_five_minute_rewrite_as_before(tmp_path: Path) -> None:
+    summary = _summary_after(
+        tmp_path,
+        (EventType.WARM_FIRED, {}),
+        (EventType.WARM_RESULT, {"usage": {"cache_read": 100_000}, "ttl_sec": 300}),
+        (EventType.RESUME_DETECTED, {}),
+    )
+
+    assert summary["rewrite_avoided_cost"] == 125_000.0
+
+
+def test_summary_counts_no_avoided_rewrite_once_compacted(tmp_path: Path) -> None:
+    summary = _summary_after(
+        tmp_path,
+        (EventType.WARM_FIRED, {}),
+        (EventType.WARM_RESULT, {"usage": {"cache_read": 100_000}, "ttl_sec": 3600}),
+        (EventType.COMPACTED, {"trigger": "manual"}),
+        (EventType.RESUME_DETECTED, {}),
+    )
+
+    assert summary["episodes"] == 0
+    assert summary["rewrite_avoided_tokens"] == 0
+    assert summary["net_savings"] == -10_000.0

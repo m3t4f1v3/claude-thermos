@@ -12,10 +12,19 @@ from claude_thermos.lineage import LineageId
 # Anthropic prompt-cache pricing, as multiples of the base input token price.
 # A warm keeps the main lineage's prefix alive with a cache read; without it the
 # prefix expires and the next real request pays a cache write to rebuild it. The
-# warmer refreshes under the 5-minute TTL, so the avoided write is the 5-minute
-# rate (1-hour writes are 2x). See Anthropic prompt-caching docs.
+# avoided write is priced by the prefix's TTL: 1.25x for five minutes, 2x for
+# one hour. See Anthropic prompt-caching docs.
 _CACHE_READ_PRICE_MULT = 0.1
 _CACHE_WRITE_PRICE_MULT = 1.25
+_CACHE_WRITE_1H_PRICE_MULT = 2.0
+_ONE_HOUR_SEC = 3600
+
+EVENTS_FILE = "events.jsonl"
+
+
+def default_log_root() -> Path:
+    """Return the directory that holds one subdirectory of logs per session."""
+    return Path.home() / ".claude-thermos" / "logs"
 
 
 class EventType(StrEnum):
@@ -32,6 +41,12 @@ class EventType(StrEnum):
     WARM_ERROR = "warm_error"
     CAP_REACHED = "cap_reached"
     RESUME_DETECTED = "resume_detected"
+    SIDE_REQUEST = "side_request"
+    COMPACTED = "compacted"
+    COMPACT_REQUESTED = "compact_requested"
+    COMPACT_SKIPPED = "compact_skipped"
+    PAUSED = "paused"
+    PAUSE_LIFTED = "pause_lifted"
 
 
 @dataclass
@@ -151,16 +166,18 @@ class EventLog:
     def __init__(
         self, session_id: str, root: Path | None = None, writer: EventWriter | None = None
     ) -> None:
-        root = root if root is not None else Path.home() / ".claude-thermos" / "logs"
+        root = root if root is not None else default_log_root()
         self._session_id = session_id
         self._session_dir = root / session_id
         self._session_dir.mkdir(parents=True, exist_ok=True)
-        self._file: TextIO = (self._session_dir / "events.jsonl").open("a")
+        self._file: TextIO = (self._session_dir / EVENTS_FILE).open("a")
         self._warms_fired = 0
         self._cache_read_total = 0
         self._episodes = 0
         self._rewrite_avoided_tokens = 0
+        self._rewrite_avoided_cost = 0.0
         self._episode_prefix_tokens = 0
+        self._episode_write_mult = _CACHE_WRITE_PRICE_MULT
         self._owns_writer = writer is None
         self._writer = writer if writer is not None else EventWriter()
 
@@ -171,9 +188,18 @@ class EventLog:
             cache_read = fields.get("usage", {}).get("cache_read", 0)
             self._cache_read_total += cache_read
             self._episode_prefix_tokens = cache_read
+            self._episode_write_mult = (
+                _CACHE_WRITE_1H_PRICE_MULT
+                if fields.get("ttl_sec", 0) >= _ONE_HOUR_SEC
+                else _CACHE_WRITE_PRICE_MULT
+            )
+        elif event is EventType.COMPACTED:
+            # The warmed prefix was summarized away, so no rewrite was avoided.
+            self._episode_prefix_tokens = 0
         elif event is EventType.RESUME_DETECTED and self._episode_prefix_tokens:
             self._episodes += 1
             self._rewrite_avoided_tokens += self._episode_prefix_tokens
+            self._rewrite_avoided_cost += self._episode_write_mult * self._episode_prefix_tokens
             self._episode_prefix_tokens = 0
         record = {"ts": round(time.time(), 3), "event": event, "lineage_id": lineage_id, **fields}
         self._writer.write(self._file, json.dumps(record) + "\n")
@@ -185,11 +211,12 @@ class EventLog:
         base-input-token units (tokens weighted by their cache multiplier).
         warm_cost is the cache-read rate paid on every warm (cache_read_total);
         rewrite_avoided_cost is one cache write per episode (rewrite_avoided_tokens),
-        each sized by that episode's last warmed prefix. net_savings goes negative
-        when a session warms more than the avoided rewrites are worth.
+        each sized by that episode's last warmed prefix and priced by its TTL.
+        net_savings goes negative when a session warms more than the avoided
+        rewrites are worth.
         """
         warm_cost = _CACHE_READ_PRICE_MULT * self._cache_read_total
-        rewrite_avoided_cost = _CACHE_WRITE_PRICE_MULT * self._rewrite_avoided_tokens
+        rewrite_avoided_cost = self._rewrite_avoided_cost
         summary = {
             "warms_fired": self._warms_fired,
             "cache_read_total": self._cache_read_total,

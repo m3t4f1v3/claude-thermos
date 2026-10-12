@@ -67,3 +67,24 @@ def parse_usage_json(body: dict) -> Usage:
         usage.get("cache_creation_input_tokens", 0),
         usage.get("output_tokens", 0),
     )
+
+
+def parse_stop_reason_sse(chunks: Iterable[bytes]) -> str | None:
+    """Return the stop_reason from an Anthropic SSE stream.
+
+    The stop reason arrives in the final `message_delta` event's `delta`.
+    It tells a finished turn (`end_turn`) apart from one that is still
+    running tools (`tool_use`).
+
+    Args:
+        chunks: Raw byte chunks of the SSE stream.
+
+    Returns:
+        The stop reason, or None if the stream carried none.
+    """
+    stop_reason = None
+    for event in _iter_sse_data(chunks):
+        delta = event.get("delta")
+        if isinstance(delta, dict) and isinstance(delta.get("stop_reason"), str):
+            stop_reason = delta["stop_reason"]
+    return stop_reason

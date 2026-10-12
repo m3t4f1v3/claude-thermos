@@ -1,7 +1,17 @@
 import hashlib
 import json
+from collections.abc import Iterator
 
 _HASH_LENGTH = 8
+
+# Claude Code prepends this attribution block to the system prompt. It carries
+# a per-conversation fingerprint that changes when the conversation is
+# compacted, and api.anthropic.com strips it before the prompt cache sees it,
+# so it is not part of the cacheable prefix and must not split a lineage.
+_ATTRIBUTION_PREFIX = "x-anthropic-billing-header:"
+
+_TTL_SEC = {"5m": 300, "1h": 3600}
+_DEFAULT_TTL_SEC = 300
 
 
 def extract_session_id(request_body: dict) -> str | None:
@@ -39,7 +49,45 @@ def _system_text(system: str | list[dict] | None) -> str:
         return ""
     if isinstance(system, str):
         return system
-    return "".join(block.get("text", "") for block in system)
+    return "".join(
+        text
+        for block in system
+        if not (text := block.get("text", "")).startswith(_ATTRIBUTION_PREFIX)
+    )
+
+
+def _iter_cache_ttls(node: object) -> Iterator[int]:
+    if isinstance(node, dict):
+        cache_control = node.get("cache_control")
+        if isinstance(cache_control, dict):
+            yield _TTL_SEC.get(cache_control.get("ttl", ""), _DEFAULT_TTL_SEC)
+        for value in node.values():
+            yield from _iter_cache_ttls(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _iter_cache_ttls(value)
+
+
+def cache_ttl_sec(request_body: dict) -> int:
+    """Return the lifetime, in seconds, of the request's cached prefix.
+
+    Reads the `ttl` of every cache_control breakpoint in tools, system, and
+    messages and returns the shortest, since the prefix is only as durable
+    as its first tier to expire. A breakpoint without a `ttl` uses the API
+    default of five minutes, as does a request with no breakpoints at all.
+
+    Args:
+        request_body: The decoded request body.
+
+    Returns:
+        300 for a five-minute prefix, 3600 for a one-hour prefix.
+    """
+    ttls = [
+        ttl
+        for key in ("tools", "system", "messages")
+        for ttl in _iter_cache_ttls(request_body.get(key))
+    ]
+    return min(ttls, default=_DEFAULT_TTL_SEC)
 
 
 class LineageId(str):
@@ -48,7 +96,8 @@ class LineageId(str):
     A distinct type (a ``str`` subclass) so it type-checks apart from
     arbitrary strings, while remaining usable as a dict key and serializing
     straight to JSON. The value is a short hex digest of the prefix identity:
-    model + sorted tool names + concatenated system text."""
+    model + sorted tool names + concatenated system text, leaving out Claude
+    Code's attribution block."""
 
     __slots__ = ()
 

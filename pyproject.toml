@@ -17,6 +17,7 @@ dev = ["pytest", "pytest-asyncio", "ruff", "ty"]
 
 [project.scripts]
 claude-thermos = "claude_thermos.cli:main"
+claude-thermos-statusline = "claude_thermos.statusline:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

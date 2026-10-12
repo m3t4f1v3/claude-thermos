@@ -1,6 +1,6 @@
 import json
 
-from claude_thermos.lineage import LineageId, extract_session_id
+from claude_thermos.lineage import LineageId, cache_ttl_sec, extract_session_id
 
 
 def _body(
@@ -78,3 +78,65 @@ def test_system_as_str_or_blocks() -> None:
         ],
     )
     assert LineageId.from_request_body(body_str) == LineageId.from_request_body(body_blocks)
+
+
+_ATTRIBUTION = "x-anthropic-billing-header: cc_version=2.1.283.{}; cc_entrypoint=cli;"
+
+
+def _system(fingerprint: str) -> list[dict[str, object]]:
+    return [
+        {"type": "text", "text": _ATTRIBUTION.format(fingerprint)},
+        {"type": "text", "text": "you are helpful", "cache_control": {"type": "ephemeral"}},
+    ]
+
+
+def test_attribution_block_does_not_split_a_lineage() -> None:
+    # Claude Code changes the block's fingerprint when a conversation is compacted.
+    before = _body("claude-opus-4-8", ["Read"], _system("edd"))
+    after = _body("claude-opus-4-8", ["Read"], _system("aba"))
+
+    assert LineageId.from_request_body(before) == LineageId.from_request_body(after)
+
+
+def test_system_text_beyond_attribution_still_splits_a_lineage() -> None:
+    main = _body("claude-opus-4-8", ["Read"], _system("edd"))
+    other = _body("claude-opus-4-8", ["Read"], _system("edd"))
+    other["system"][1]["text"] = "you are a subagent"
+
+    assert LineageId.from_request_body(main) != LineageId.from_request_body(other)
+
+
+def _marked(ttl: str | None) -> dict[str, object]:
+    cache_control: dict[str, str] = {"type": "ephemeral"}
+    if ttl is not None:
+        cache_control["ttl"] = ttl
+    return {"type": "text", "text": "x", "cache_control": cache_control}
+
+
+def test_cache_ttl_reads_one_hour_breakpoints() -> None:
+    body = _body("claude-opus-4-8", ["Read"], [_marked("1h")])
+    body["messages"] = [{"role": "user", "content": [_marked("1h")]}]
+
+    assert cache_ttl_sec(body) == 3600
+
+
+def test_cache_ttl_defaults_to_five_minutes() -> None:
+    unmarked = _body("claude-opus-4-8", ["Read"], "you are helpful")
+    default_ttl = _body("claude-opus-4-8", ["Read"], [_marked(None)])
+
+    assert cache_ttl_sec(unmarked) == 300
+    assert cache_ttl_sec(default_ttl) == 300
+
+
+def test_cache_ttl_is_the_shortest_breakpoint() -> None:
+    body = _body("claude-opus-4-8", ["Read"], [_marked("1h")])
+    body["messages"] = [{"role": "user", "content": [_marked("5m")]}]
+
+    assert cache_ttl_sec(body) == 300
+
+
+def test_cache_ttl_ignores_cache_control_outside_the_prefix() -> None:
+    body = _body("claude-opus-4-8", ["Read"], [_marked("1h")])
+    body["metadata"] = {"cache_control": {"type": "ephemeral", "ttl": "5m"}}
+
+    assert cache_ttl_sec(body) == 3600

@@ -143,3 +143,96 @@ def test_serve_is_not_swallowed_by_passthrough(monkeypatch: pytest.MonkeyPatch) 
     result = CliRunner().invoke(main, ["serve"])
 
     assert result.exit_code == 0
+
+
+def _recorded_config(monkeypatch: pytest.MonkeyPatch, args: list[str]) -> Config:
+    captured = {}
+
+    def recorder(config: Config, claude_args: list[str], claude_bin: str = "claude") -> int:
+        captured["config"] = config
+        return 0
+
+    monkeypatch.setattr("claude_thermos.cli.run_launcher", recorder)
+    result = CliRunner().invoke(main, args)
+    assert result.exit_code == 0, result.output
+    return captured["config"]
+
+
+def test_keepalive_and_compaction_are_on_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _recorded_config(monkeypatch, [])
+
+    assert config.keepalive is True
+    assert config.keepalive_interval_sec is None
+    assert config.ping_budget == 0.10
+    assert config.session_reserve == 0.05
+    assert config.compact is True
+    assert config.compact_min_tokens == 100_000
+    assert config.pause_at == 0.95
+
+
+def test_keepalive_options_reach_the_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _recorded_config(
+        monkeypatch,
+        [
+            "--no-keepalive",
+            "--keepalive-interval",
+            "1800",
+            "--ping-budget",
+            "25",
+            "--session-reserve",
+            "5",
+            "--no-compact",
+            "--compact-min-tokens",
+            "0",
+            "--pause-at",
+            "100",
+        ],
+    )
+
+    assert config.keepalive is False
+    assert config.keepalive_interval_sec == 1800
+    assert config.ping_budget == 0.25
+    assert config.session_reserve == 0.05
+    assert config.compact is False
+    assert config.compact_min_tokens == 0
+    assert config.pause_at is None
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (["--ping-budget", "150"], "ping-budget must be a percentage between 0 and 100"),
+        (["--session-reserve", "-1"], "session-reserve must be a percentage between 0 and 100"),
+        (["--keepalive-interval", "never"], "keepalive-interval must be a positive integer"),
+    ],
+)
+def test_bad_keepalive_options_report_errors(args: list[str], message: str) -> None:
+    result = CliRunner().invoke(main, args)
+
+    assert result.exit_code != 0
+    assert message in result.output
+
+
+def test_serve_takes_keepalive_options_but_never_compacts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = {}
+
+    def recorder(config: Config, port: int, upstream: str) -> int:
+        captured["config"] = config
+        return 0
+
+    monkeypatch.setattr("claude_thermos.cli.run_server", recorder)
+
+    result = CliRunner().invoke(main, ["serve", "--ping-budget", "20"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["config"].keepalive is True
+    assert captured["config"].ping_budget == 0.20
+    assert captured["config"].compact is False
+
+
+def test_serve_does_not_accept_compact() -> None:
+    result = CliRunner().invoke(main, ["serve", "--compact"])
+
+    assert result.exit_code != 0
